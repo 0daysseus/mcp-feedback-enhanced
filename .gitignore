@@ -85,3 +85,4 @@ yarn.lock
 # Temporary build files
 *.tmp
 *.temp
+.github/agents
