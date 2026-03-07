@@ -174,6 +174,8 @@ pip install uv
 | `MCP_WEB_PORT` | Web UI 端口 | `1024-65535` | `8765` |
 | `MCP_DESKTOP_MODE` | 桌面应用程序模式 | `true`/`false` | `false` |
 | `MCP_LANGUAGE` | 强制指定界面语言 | `zh-TW`/`zh-CN`/`en` | 自动检测 |
+| `MCP_TELEGRAM_BOT_TOKEN` | Telegram Bot 回退反馈令牌 | Telegram Bot 令牌字符串 | 未启用 |
+| `MCP_TELEGRAM_CHAT_ID` | Telegram 回退反馈固定聊天 ID | 固定 Telegram 聊天 ID | 未启用 |
 
 **`MCP_WEB_HOST` 说明**：
 - `127.0.0.1`（默认）：仅本地访问，安全性较高
@@ -191,6 +193,24 @@ pip install uv
   3. 系统环境变量（LANG、LC_ALL 等）
   4. 系统默认语言
   5. 回退到默认语言（繁体中文）
+
+### Telegram 回退工具
+
+当用户离开电脑时，AI 可以显式调用新的 `telegram_feedback` MCP 工具，把 Telegram 作为手动回退反馈通道。
+
+- 必需环境变量：
+  - `MCP_TELEGRAM_BOT_TOKEN`
+  - `MCP_TELEGRAM_CHAT_ID`
+- 行为：
+  - 工具会把当前 `summary` 和 `project_directory` 发到配置好的 Telegram 对话
+  - 用户可以回复文字和图片
+  - 用户发送 `/done` 提交，发送 `/cancel` 取消
+- 范围：
+  - `telegram_feedback` 是额外的 fallback 工具
+  - 它不会自动替代现有的 `interactive_feedback`
+  - 第一版只支持固定的 `MCP_TELEGRAM_CHAT_ID`
+  - 第一版只支持文字和图片回复
+  - 不支持在 Telegram 内执行命令或进行命令日志交互
 
 ### 测试选项
 ```bash

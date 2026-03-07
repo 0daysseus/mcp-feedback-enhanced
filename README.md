@@ -174,6 +174,8 @@ follow mcp-feedback-enhanced instructions
 | `MCP_WEB_PORT` | Web UI port | `1024-65535` | `8765` |
 | `MCP_DESKTOP_MODE` | Desktop application mode | `true`/`false` | `false` |
 | `MCP_LANGUAGE` | Force UI language | `zh-TW`/`zh-CN`/`en` | Auto-detect |
+| `MCP_TELEGRAM_BOT_TOKEN` | Telegram Bot token for fallback feedback | Telegram bot token string | Disabled |
+| `MCP_TELEGRAM_CHAT_ID` | Fixed Telegram chat id for fallback feedback | Fixed Telegram chat id | Disabled |
 
 **`MCP_WEB_HOST` Explanation**:
 - `127.0.0.1` (default): Local access only, higher security
@@ -191,6 +193,24 @@ follow mcp-feedback-enhanced instructions
   3. System environment variables (LANG, LC_ALL, etc.)
   4. System default language
   5. Fallback to default language (Traditional Chinese)
+
+### Telegram Fallback Tool
+
+When the user is away from the computer, AI agents can explicitly call the new `telegram_feedback` MCP tool as a manual fallback channel.
+
+- Required environment variables:
+  - `MCP_TELEGRAM_BOT_TOKEN`
+  - `MCP_TELEGRAM_CHAT_ID`
+- Behavior:
+  - The tool sends the current `summary` and `project_directory` to the configured Telegram chat
+  - The user can reply with text and images
+  - The user sends `/done` to submit or `/cancel` to abort
+- Scope:
+  - `telegram_feedback` is an extra fallback tool
+  - It does not automatically replace `interactive_feedback`
+  - First version only supports a fixed `MCP_TELEGRAM_CHAT_ID`
+  - First version only supports text and image replies
+  - Telegram command execution and command-log interaction are not supported
 
 ### Testing Options
 ```bash

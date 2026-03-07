@@ -37,6 +37,12 @@ from pydantic import Field
 
 # 導入統一的調試功能
 from .debug import server_debug_log as debug_log
+from .telegram import (
+    TelegramBotClient,
+    TelegramClientError,
+    TelegramFeedbackCancelled,
+    TelegramFeedbackSession,
+)
 
 # 導入多語系支援
 # 導入錯誤處理框架
@@ -111,6 +117,10 @@ _encoding_initialized = init_encoding()
 SERVER_NAME = "互動式回饋收集 MCP"
 SSH_ENV_VARS = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
 REMOTE_ENV_VARS = ["REMOTE_CONTAINERS", "CODESPACES"]
+REQUIRED_TELEGRAM_COMMANDS = [
+    {"command": "done", "description": "Submit feedback"},
+    {"command": "cancel", "description": "Cancel feedback"},
+]
 
 
 # 初始化 MCP 服務器
@@ -425,6 +435,74 @@ def process_images(images_data: list[dict]) -> list[MCPImage]:
     return mcp_images
 
 
+def build_feedback_items(result: dict | None) -> list:
+    """Build MCP feedback items from a channel result payload."""
+    if not result:
+        return [TextContent(type="text", text="用戶取消了回饋。")]
+
+    feedback_items = []
+
+    if (
+        result.get("interactive_feedback")
+        or result.get("command_logs")
+        or result.get("images")
+    ):
+        feedback_text = create_feedback_text(result)
+        feedback_items.append(TextContent(type="text", text=feedback_text))
+        debug_log("文字回饋已添加")
+
+    if result.get("images"):
+        mcp_images = process_images(result["images"])
+        feedback_items.extend(mcp_images)
+        debug_log(f"已添加 {len(mcp_images)} 張圖片")
+
+    if not feedback_items:
+        feedback_items.append(TextContent(type="text", text="用戶未提供任何回饋內容。"))
+
+    return feedback_items
+
+
+async def ensure_telegram_commands(client: TelegramBotClient) -> None:
+    """Ensure the Telegram bot exposes the slash commands used by the feedback flow."""
+    current_commands = await client.get_commands()
+    merged_commands: list[dict[str, str]] = []
+    command_index: dict[str, dict[str, str]] = {}
+
+    for command in current_commands:
+        if not isinstance(command, dict):
+            continue
+
+        name = command.get("command")
+        if not isinstance(name, str) or not name:
+            continue
+
+        description = command.get("description")
+        normalized_command = {
+            "command": name,
+            "description": description if isinstance(description, str) else "",
+        }
+        merged_commands.append(normalized_command)
+        command_index[name] = normalized_command
+
+    needs_update = False
+    for required_command in REQUIRED_TELEGRAM_COMMANDS:
+        existing_command = command_index.get(required_command["command"])
+        if existing_command is None:
+            merged_commands.append(dict(required_command))
+            needs_update = True
+            continue
+
+        if existing_command["description"] != required_command["description"]:
+            existing_command["description"] = required_command["description"]
+            needs_update = True
+
+    if needs_update:
+        await client.set_commands(merged_commands)
+        debug_log("Telegram commands registered or updated")
+    else:
+        debug_log("Telegram commands already up to date")
+
+
 # ===== MCP 工具定義 =====
 @mcp.tool()
 async def interactive_feedback(
@@ -469,38 +547,10 @@ async def interactive_feedback(
 
         result = await launch_web_feedback_ui(project_directory, summary, timeout)
 
-        # 處理取消情況
-        if not result:
-            return [TextContent(type="text", text="用戶取消了回饋。")]
-
         # 儲存詳細結果
-        save_feedback_to_file(result)
-
-        # 建立回饋項目列表
-        feedback_items = []
-
-        # 添加文字回饋
-        if (
-            result.get("interactive_feedback")
-            or result.get("command_logs")
-            or result.get("images")
-        ):
-            feedback_text = create_feedback_text(result)
-            feedback_items.append(TextContent(type="text", text=feedback_text))
-            debug_log("文字回饋已添加")
-
-        # 添加圖片回饋
-        if result.get("images"):
-            mcp_images = process_images(result["images"])
-            # 修復 arg-type 錯誤 - 直接擴展列表
-            feedback_items.extend(mcp_images)
-            debug_log(f"已添加 {len(mcp_images)} 張圖片")
-
-        # 確保至少有一個回饋項目
-        if not feedback_items:
-            feedback_items.append(
-                TextContent(type="text", text="用戶未提供任何回饋內容。")
-            )
+        if result:
+            save_feedback_to_file(result)
+        feedback_items = build_feedback_items(result)
 
         debug_log(f"回饋收集完成，共 {len(feedback_items)} 個項目")
         return feedback_items
@@ -557,6 +607,94 @@ async def launch_web_feedback_ui(project_dir: str, summary: str, timeout: int) -
             "interactive_feedback": user_error_msg,
             "images": [],
         }
+
+
+async def launch_telegram_feedback(project_dir: str, summary: str, timeout: int) -> dict:
+    """
+    啟動 Telegram Bot 回饋收集。
+
+    Args:
+        project_dir: 專案目錄路徑
+        summary: AI 工作摘要
+        timeout: 超時時間（秒）
+
+    Returns:
+        dict: 收集到的回饋資料
+    """
+    debug_log(f"啟動 Telegram 回饋，超時時間: {timeout} 秒")
+
+    try:
+        session = TelegramFeedbackSession.from_environment(summary, project_dir)
+        client = TelegramBotClient(
+            token=session.bot_token,
+            api_base=session.api_base,
+        )
+        await ensure_telegram_commands(client)
+
+        prompt_text = (
+            "AI 工作摘要:\n"
+            f"{summary}\n\n"
+            "專案目錄:\n"
+            f"{project_dir}\n\n"
+            "請直接回覆文字與圖片。\n"
+            "送出請輸入 /done\n"
+            "取消請輸入 /cancel"
+        )
+        await client.send_message(session.chat_id, prompt_text)
+        return await session.collect_feedback(client, timeout)
+    except ValueError as e:
+        debug_log(f"Telegram 配置錯誤: {e}")
+        return {
+            "command_logs": "",
+            "interactive_feedback": str(e),
+            "images": [],
+        }
+    except TelegramClientError as e:
+        debug_log(f"Telegram API 錯誤: {e}")
+        return {
+            "command_logs": "",
+            "interactive_feedback": str(e),
+            "images": [],
+        }
+    except TelegramFeedbackCancelled:
+        debug_log("Telegram 回饋已取消")
+        return {}
+
+
+@mcp.tool()
+async def telegram_feedback(
+    project_directory: Annotated[str, Field(description="專案目錄路徑")] = ".",
+    summary: Annotated[
+        str, Field(description="AI 工作完成的摘要說明")
+    ] = "我已完成了您請求的任務。",
+    timeout: Annotated[int, Field(description="等待用戶回饋的超時時間（秒）")] = 600,
+) -> list:
+    """Telegram feedback collection tool for LLM agents."""
+    try:
+        if not os.path.exists(project_directory):
+            project_directory = os.getcwd()
+        project_directory = os.path.abspath(project_directory)
+
+        debug_log("回饋模式: telegram")
+        result = await launch_telegram_feedback(project_directory, summary, timeout)
+
+        if result:
+            save_feedback_to_file(result)
+
+        feedback_items = build_feedback_items(result)
+        debug_log(f"Telegram 回饋收集完成，共 {len(feedback_items)} 個項目")
+        return feedback_items
+
+    except Exception as e:
+        error_id = ErrorHandler.log_error_with_context(
+            e,
+            context={"operation": "Telegram 回饋收集", "project_dir": project_directory},
+            error_type=ErrorType.SYSTEM,
+        )
+        user_error_msg = ErrorHandler.format_user_error(e, include_technical=False)
+        debug_log(f"Telegram 回饋收集錯誤 [錯誤ID: {error_id}]: {e!s}")
+
+        return [TextContent(type="text", text=user_error_msg)]
 
 
 @mcp.tool()

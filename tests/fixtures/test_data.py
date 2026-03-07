@@ -77,7 +77,15 @@ class TestData:
     TEST_ENV_VARS: Dict[str, str] = {
         "MCP_DEBUG": "true",
         "MCP_WEB_PORT": "8765",
-        "MCP_TEST_MODE": "true"
+        "MCP_TEST_MODE": "true",
+        "MCP_TELEGRAM_BOT_TOKEN": "test-telegram-token",
+        "MCP_TELEGRAM_CHAT_ID": "123456789",
+    }
+
+    TELEGRAM_TEST_CONFIG: Dict[str, str] = {
+        "bot_token": "test-telegram-token",
+        "chat_id": "123456789",
+        "api_base": "https://api.telegram.org",
     }
 
     # 測試配置
