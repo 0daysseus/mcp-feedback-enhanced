@@ -83,6 +83,40 @@ async def test_send_message_posts_to_expected_endpoint():
 
 
 @pytest.mark.asyncio
+async def test_send_message_accepts_inline_keyboard_markup():
+    fake_session = FakeSession(
+        post_responses=[
+            FakeResponse(json_body={"ok": True, "result": {"message_id": 10}})
+        ]
+    )
+    client = TelegramBotClient(token=TEST_BOT_TOKEN, session_factory=lambda: fake_session)
+
+    await client.send_message(
+        chat_id="123456789",
+        text="choose a directory",
+        reply_markup={
+            "inline_keyboard": [[{"text": "select", "callback_data": "sub:select"}]]
+        },
+    )
+
+    assert fake_session.post_calls == [
+        {
+            "url": f"{DEFAULT_TELEGRAM_API_BASE}/bot{TEST_BOT_TOKEN}/sendMessage",
+            "json": {
+                "chat_id": "123456789",
+                "text": "choose a directory",
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [{"text": "select", "callback_data": "sub:select"}]
+                    ]
+                },
+            },
+            "ssl": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_get_updates_passes_offset_and_timeout():
     fake_session = FakeSession(
         get_responses=[FakeResponse(json_body={"ok": True, "result": [{"update_id": 1}]})]
@@ -157,6 +191,60 @@ async def test_set_commands_posts_global_bot_commands():
                     {"command": "cancel", "description": "Cancel feedback"},
                 ]
             },
+            "ssl": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_edit_message_text_posts_updated_message_markup():
+    fake_session = FakeSession(
+        post_responses=[FakeResponse(json_body={"ok": True, "result": True})]
+    )
+    client = TelegramBotClient(token=TEST_BOT_TOKEN, session_factory=lambda: fake_session)
+
+    result = await client.edit_message_text(
+        chat_id="123456789",
+        message_id=42,
+        text="updated",
+        reply_markup={
+            "inline_keyboard": [[{"text": "next", "callback_data": "sub:page:1"}]]
+        },
+    )
+
+    assert result is True
+    assert fake_session.post_calls == [
+        {
+            "url": f"{DEFAULT_TELEGRAM_API_BASE}/bot{TEST_BOT_TOKEN}/editMessageText",
+            "json": {
+                "chat_id": "123456789",
+                "message_id": 42,
+                "text": "updated",
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [{"text": "next", "callback_data": "sub:page:1"}]
+                    ]
+                },
+            },
+            "ssl": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_answer_callback_query_posts_acknowledgement():
+    fake_session = FakeSession(
+        post_responses=[FakeResponse(json_body={"ok": True, "result": True})]
+    )
+    client = TelegramBotClient(token=TEST_BOT_TOKEN, session_factory=lambda: fake_session)
+
+    result = await client.answer_callback_query("callback-1", text="OK")
+
+    assert result is True
+    assert fake_session.post_calls == [
+        {
+            "url": f"{DEFAULT_TELEGRAM_API_BASE}/bot{TEST_BOT_TOKEN}/answerCallbackQuery",
+            "json": {"callback_query_id": "callback-1", "text": "OK"},
             "ssl": None,
         }
     ]

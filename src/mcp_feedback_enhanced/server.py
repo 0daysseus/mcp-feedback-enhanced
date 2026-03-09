@@ -774,7 +774,11 @@ def main():
 
     try:
         # 使用正確的 FastMCP API
-        mcp.run()
+        run_mcp_server(
+            transport=os.getenv("MCP_TRANSPORT", "stdio"),
+            host=os.getenv("MCP_HTTP_HOST", "127.0.0.1"),
+            port=int(os.getenv("MCP_HTTP_PORT", "8000")),
+        )
     except KeyboardInterrupt:
         if debug_enabled:
             debug_log("收到中斷信號，正常退出")
@@ -786,6 +790,18 @@ def main():
 
             debug_log(f"詳細錯誤: {traceback.format_exc()}")
         sys.exit(1)
+
+def run_mcp_server(
+    transport: str = "stdio",
+    host: str | None = None,
+    port: int | None = None,
+) -> None:
+    """Run the FastMCP server with the requested transport."""
+    if transport == "http":
+        mcp.run(transport="http", host=host, port=port)
+        return
+
+    mcp.run()
 
 
 if __name__ == "__main__":

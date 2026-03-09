@@ -30,11 +30,17 @@ class TelegramBotClient:
         self._session_factory = session_factory
         self._request_kwargs = self._build_request_kwargs()
 
-    async def send_message(self, chat_id: str, text: str) -> dict[str, Any]:
+    async def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Send a text message to a Telegram chat."""
-        return await self._post_json(
-            "sendMessage", {"chat_id": chat_id, "text": text}
-        )
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return await self._post_json("sendMessage", payload)
 
     async def get_updates(
         self, offset: int | None = None, timeout: int = 30
@@ -54,6 +60,36 @@ class TelegramBotClient:
     async def set_commands(self, commands: list[dict[str, str]]) -> bool:
         """Set the bot's global slash command list."""
         result = await self._post_json("setMyCommands", {"commands": commands})
+        return bool(result)
+
+    async def edit_message_text(
+        self,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        """Edit an existing Telegram message."""
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        result = await self._post_json("editMessageText", payload)
+        return bool(result)
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+    ) -> bool:
+        """Acknowledge a Telegram callback query."""
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text is not None:
+            payload["text"] = text
+        result = await self._post_json("answerCallbackQuery", payload)
         return bool(result)
 
     async def get_file(self, file_id: str) -> dict[str, Any]:

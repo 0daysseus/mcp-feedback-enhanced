@@ -40,7 +40,27 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 
     # 伺服器命令（預設）
-    subparsers.add_parser("server", help="啟動 MCP 伺服器（預設）")
+    server_parser = subparsers.add_parser("server", help="啟動 MCP 伺服器（預設）")
+    server_parser.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        help="MCP 伺服器傳輸模式",
+    )
+    server_parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HTTP_HOST", "127.0.0.1"),
+        help="HTTP 傳輸模式下的綁定主機",
+    )
+    server_parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("MCP_HTTP_PORT", "8000")),
+        help="HTTP 傳輸模式下的監聽埠",
+    )
+
+    # Telegram gateway 命令
+    subparsers.add_parser("telegram-gateway", help="啟動 Telegram gateway 模式")
 
     # 測試命令
     test_parser = subparsers.add_parser("test", help="執行測試")
@@ -64,18 +84,31 @@ def main():
     elif args.command == "version":
         show_version()
     elif args.command == "server" or args.command is None:
-        run_server()
+        run_server(
+            transport=getattr(args, "transport", "stdio"),
+            host=getattr(args, "host", None),
+            port=getattr(args, "port", None),
+        )
+    elif args.command == "telegram-gateway":
+        run_telegram_gateway()
     else:
         # 不應該到達這裡
         parser.print_help()
         sys.exit(1)
 
 
-def run_server():
+def run_server(transport="stdio", host=None, port=None):
     """啟動 MCP 伺服器"""
-    from .server import main as server_main
+    from .server import run_mcp_server
 
-    return server_main()
+    return run_mcp_server(transport=transport, host=host, port=port)
+
+
+def run_telegram_gateway():
+    """啟動 Telegram gateway。"""
+    from .telegram.gateway import run_gateway
+
+    return run_gateway()
 
 
 def run_tests(args):

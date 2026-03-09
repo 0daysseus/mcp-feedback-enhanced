@@ -176,6 +176,8 @@ pip install uv
 | `MCP_LANGUAGE` | 強制指定介面語言 | `zh-TW`/`zh-CN`/`en` | 自動偵測 |
 | `MCP_TELEGRAM_BOT_TOKEN` | Telegram Bot 回退回饋權杖 | Telegram Bot 權杖字串 | 未啟用 |
 | `MCP_TELEGRAM_CHAT_ID` | Telegram 回退回饋固定聊天 ID | 固定 Telegram 聊天 ID | 未啟用 |
+| `MCP_TELEGRAM_DISABLE_SSL_VERIFY` | 在本地 CA 異常環境裡停用 Telegram TLS 驗證 | `true`/`false` | `false` |
+| `MCP_CODEX_ROOT` | Telegram gateway 可瀏覽的根目錄 | 絕對目錄路徑 | `/home/kube` |
 
 **`MCP_WEB_HOST` 說明**：
 - `127.0.0.1`（預設）：僅本地存取，安全性較高
@@ -211,6 +213,38 @@ pip install uv
   - 第一版只支援固定的 `MCP_TELEGRAM_CHAT_ID`
   - 第一版只支援文字與圖片回覆
   - 不支援在 Telegram 內執行命令或進行命令日誌互動
+
+### Telegram Gateway 模式
+
+把 Telegram 當成 Codex 的遠端控制入口：
+
+```bash
+uvx --from git+https://github.com/0daysseus/mcp-feedback-enhanced.git@main \
+  mcp-feedback-enhanced telegram-gateway
+```
+
+- 支援的 Telegram slash command：
+  - `/submit`：瀏覽目錄後提交新的 Codex 任務
+  - `/resume`：瀏覽目錄後再送出一條 resume prompt，用於執行 `codex exec resume --last`
+  - `/tasks`：查看目前執行中的任務並刷新最新狀態
+  - `/cancel`：取消目前的 Telegram gateway 互動
+- 行為：
+  - 目錄瀏覽限制在 `MCP_CODEX_ROOT` 下，並隱藏 `.` 開頭的目錄
+  - `/submit` 會注入額外提示，強制 Codex 在結束前呼叫 `telegram_feedback`
+  - `/submit` 依賴你的 Codex 設定裡已經接好能暴露 `telegram_feedback` 的 `mcp-feedback-enhanced` MCP server；gateway 行程本身不會把 MCP 工具暴露給 Codex
+  - gateway 任務會以 JSON 模式執行 `codex exec`，並追蹤最新狀態與 usage
+  - 最終 Telegram 完成訊息會附上最後的 Codex 結果與可用的 usage
+
+### HTTP 方式執行 MCP Server
+
+MCP server 預設仍是 stdio，但現在也支援 Streamable HTTP：
+
+```bash
+uvx --from git+https://github.com/0daysseus/mcp-feedback-enhanced.git@main \
+  mcp-feedback-enhanced server --transport http --host 127.0.0.1 --port 8000
+```
+
+FastMCP 使用預設的 Streamable HTTP 端點形式，所以客戶端應連到 `/mcp/`。
 
 ### 測試選項
 ```bash

@@ -176,6 +176,8 @@ follow mcp-feedback-enhanced instructions
 | `MCP_LANGUAGE` | Force UI language | `zh-TW`/`zh-CN`/`en` | Auto-detect |
 | `MCP_TELEGRAM_BOT_TOKEN` | Telegram Bot token for fallback feedback | Telegram bot token string | Disabled |
 | `MCP_TELEGRAM_CHAT_ID` | Fixed Telegram chat id for fallback feedback | Fixed Telegram chat id | Disabled |
+| `MCP_TELEGRAM_DISABLE_SSL_VERIFY` | Disable Telegram TLS verification in broken local CA environments | `true`/`false` | `false` |
+| `MCP_CODEX_ROOT` | Root directory exposed to Telegram gateway browsing | Absolute directory path | `/home/kube` |
 
 **`MCP_WEB_HOST` Explanation**:
 - `127.0.0.1` (default): Local access only, higher security
@@ -211,6 +213,38 @@ When the user is away from the computer, AI agents can explicitly call the new `
   - First version only supports a fixed `MCP_TELEGRAM_CHAT_ID`
   - First version only supports text and image replies
   - Telegram command execution and command-log interaction are not supported
+
+### Telegram Gateway Mode
+
+Use Telegram as a remote control plane for Codex jobs:
+
+```bash
+uvx --from git+https://github.com/0daysseus/mcp-feedback-enhanced.git@main \
+  mcp-feedback-enhanced telegram-gateway
+```
+
+- Supported Telegram slash commands:
+  - `/submit`: browse directories, then send a new Codex task
+  - `/resume`: browse directories, then send a resume prompt for `codex exec resume --last`
+  - `/tasks`: inspect the current running job and refresh the latest tracked status
+  - `/cancel`: cancel the current Telegram gateway interaction
+- Behavior:
+  - Directory browsing is restricted to `MCP_CODEX_ROOT` and hides dot-prefixed directories
+  - `/submit` injects extra instructions so Codex must call `telegram_feedback` before finishing
+  - `/submit` assumes your Codex configuration already includes an `mcp-feedback-enhanced` MCP server that exposes `telegram_feedback`; the gateway process itself does not expose MCP tools to Codex
+  - Gateway jobs run `codex exec` in JSON mode and track the latest status plus usage
+  - Final Telegram completion messages include the last Codex result and usage when available
+
+### MCP Server Over HTTP
+
+The MCP server still defaults to stdio, but can also listen over Streamable HTTP:
+
+```bash
+uvx --from git+https://github.com/0daysseus/mcp-feedback-enhanced.git@main \
+  mcp-feedback-enhanced server --transport http --host 127.0.0.1 --port 8000
+```
+
+FastMCP uses the default Streamable HTTP endpoint shape, so clients should connect to `/mcp/`.
 
 ### Testing Options
 ```bash
