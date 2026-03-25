@@ -65,8 +65,8 @@ packages = ["src/mcp_feedback_enhanced"]
 # 桌面應用程式二進制檔案現在直接存儲在 Git 中
 # 由 build-desktop.yml 工作流程自動構建並提交
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "bump2version>=1.0.1",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

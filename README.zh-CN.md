@@ -172,8 +172,13 @@ pip install uv
 | `MCP_DEBUG` | 调试模式 | `true`/`false` | `false` |
 | `MCP_WEB_HOST` | Web UI 主机绑定 | IP 地址或主机名 | `127.0.0.1` |
 | `MCP_WEB_PORT` | Web UI 端口 | `1024-65535` | `8765` |
+| `MCP_FEEDBACK_TIMEOUT` | `interactive_feedback` / `telegram_feedback` / `telegram_confirm_completion` 等待超时（仅环境变量） | 正整数（秒） | `600` |
 | `MCP_DESKTOP_MODE` | 桌面应用程序模式 | `true`/`false` | `false` |
 | `MCP_LANGUAGE` | 强制指定界面语言 | `zh-TW`/`zh-CN`/`en` | 自动检测 |
+| `MCP_TELEGRAM_BOT_TOKEN` | Telegram Bot 回退反馈令牌 | Telegram Bot 令牌字符串 | 未启用 |
+| `MCP_TELEGRAM_CHAT_ID` | Telegram 回退反馈固定聊天 ID | 固定 Telegram 聊天 ID | 未启用 |
+| `MCP_TELEGRAM_DISABLE_SSL_VERIFY` | 在本地 CA 异常环境里关闭 Telegram TLS 校验 | `true`/`false` | `false` |
+| `MCP_CODEX_ROOT` | Telegram gateway 可浏览的根目录 | 绝对目录路径 | `/home/kube` |
 
 **`MCP_WEB_HOST` 说明**：
 - `127.0.0.1`（默认）：仅本地访问，安全性较高
@@ -191,6 +196,71 @@ pip install uv
   3. 系统环境变量（LANG、LC_ALL 等）
   4. 系统默认语言
   5. 回退到默认语言（繁体中文）
+
+**`MCP_FEEDBACK_TIMEOUT` 说明**：
+- 控制 `interactive_feedback`、`telegram_feedback` 与 `telegram_confirm_completion` 等待用户反馈的超时时间。
+- 该超时仅支持通过环境变量配置，不再接受工具参数传入。
+
+### Telegram 回退工具
+
+当用户离开电脑时，AI 可以显式调用新的 `telegram_feedback` MCP 工具，把 Telegram 作为手动回退反馈通道。
+
+- 必需环境变量：
+  - `MCP_TELEGRAM_BOT_TOKEN`
+  - `MCP_TELEGRAM_CHAT_ID`
+- 行为：
+  - 工具会把当前 `summary` 和 `project_directory` 发到配置好的 Telegram 对话
+  - 用户可以回复文字和图片
+  - 用户发送 `/done` 提交，发送 `/cancel` 取消
+- 范围：
+  - `telegram_feedback` 是额外的 fallback 工具
+  - 当用户在电脑前时，非 Telegram 任务仍应优先调用 `interactive_feedback`
+  - 如果第一次 `interactive_feedback` 调用超时，它现在会直接返回错误，明确要求 agent 改用 `telegram_feedback`
+  - 如果已开启 away 状态，`interactive_feedback` 会立即报错，并提示 agent 改用 `telegram_feedback`
+  - 第一版只支持固定的 `MCP_TELEGRAM_CHAT_ID`
+  - 第一版只支持文字和图片回复
+  - 不支持在 Telegram 内执行命令或进行命令日志交互
+
+### Telegram Gateway 模式
+
+把 Telegram 当作 Codex 远程控制入口：
+
+```bash
+uvx --from git+https://github.com/0daysseus/mcp-feedback-enhanced.git@main \
+  mcp-feedback-enhanced telegram-gateway
+```
+
+- 支持的 Telegram slash command：
+  - `/away`：切换“是否离开电脑”的状态；命令描述会随当前状态变化
+  - `/submit`：浏览目录后提交一个新的 Codex 任务
+  - `/resume`：先选择一个可续跑的 Codex session，再发送续跑提示
+  - `/steer`：先收集后续输入文本，再选择一个 loaded session 继续
+  - `/sessions`：列出允许目录范围内可续跑的 Codex session
+  - `/tasks`：列出当前由 gateway 保留的 loaded Codex session
+  - `/cancel`：取消当前 Telegram gateway 交互
+- 行为：
+  - `/away` 会切换持久化的 away 状态，供 `interactive_feedback` 判断；也支持显式使用 `/away on` 和 `/away off`
+  - 目录浏览限制在 `MCP_CODEX_ROOT` 下，并隐藏 `.` 开头的目录
+  - `/submit` 会注入额外提示，强制 Codex 在结束前调用 `telegram_feedback`
+  - `/submit` 依赖你的 Codex 配置里已经接好了能暴露 `telegram_feedback` 的 `mcp-feedback-enhanced` MCP server；gateway 进程本身不会把 MCP 工具暴露给 Codex
+  - gateway 通过 JSONL stdio 连接 `codex app-server --listen stdio://`，用 `thread/list` 提供 `/sessions`，用 `thread/start`/`thread/resume` + `turn/start` 驱动任务执行
+  - `/sessions` 和 `/resume` 直接展示 app-server 的实时线程历史，不再自己维护一份本地 session 注册表
+  - gateway 会保留已完成或已续跑的 loaded session，供 `/tasks` 查看以及 `/steer` 继续
+  - `/steer` 会先收集一段或多段普通文本，用户发送 `/done` 后再弹出 loaded session 选择框；如果目标 session 仍在活动 turn 中就走 `turn/steer`，否则会在同一个 thread 上启动新 turn
+  - 最终 Telegram 完成消息会附带最后的 Codex 结果和可用的 usage
+
+### HTTP 方式运行 MCP Server
+
+MCP server 默认仍然是 stdio，但现在也支持 Streamable HTTP：
+
+```bash
+uvx --from git+https://github.com/0daysseus/mcp-feedback-enhanced.git@main \
+  mcp-feedback-enhanced server --transport http --host 127.0.0.1 --port 8000
+```
+
+FastMCP 使用默认的 Streamable HTTP 端点形式，所以客户端应连接到 `/mcp/`。
+
+当配置了 `MCP_TELEGRAM_BOT_TOKEN` 与 `MCP_TELEGRAM_CHAT_ID` 时，HTTP 模式现在也会在后台自动启动 Telegram gateway，因此 `/submit`、`/resume`、`/sessions`、`/tasks` 会由同一个进程完成注册与处理。
 
 ### 测试选项
 ```bash
@@ -269,6 +339,10 @@ make quick-check                                        # 快速检查并自动�
 ### 🌐 SSH Remote 环境问题
 **Q: SSH Remote 环境下浏览器无法启动或无法访问**
 A: 提供两种解决方案：
+
+**重要提示（interactive_feedback 前置条件）**
+在 **远端 + 无图形界面**（没有 `DISPLAY`）的环境下，`interactive_feedback` 需要 IDE Remote 提供的 `BROWSER` 与 `VSCODE_IPC_HOOK_CLI` 两个环境变量。
+如果工具报错提示缺少其中之一，请改用 `telegram_feedback`（或先调用 `get_system_info` 确认 MCP 进程实际拿到的环境变量）。
 
 **方案一：环境变量设置（v2.5.5 推荐）**
 在 MCP 配置中设置 `"MCP_WEB_HOST": "0.0.0.0"` 允许远程访问：

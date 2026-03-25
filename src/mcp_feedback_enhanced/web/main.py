@@ -28,6 +28,7 @@ from ..utils.memory_monitor import get_memory_monitor
 from .models import CleanupReason, SessionStatus, WebFeedbackSession
 from .routes import setup_routes
 from .utils import get_browser_opener
+from .utils.browser import get_browser_launch_strategy
 from .utils.compression_config import get_compression_manager
 from .utils.port_manager import PortManager
 
@@ -134,6 +135,7 @@ class WebUIManager:
         self.server_thread: threading.Thread | None = None
         self.server_process = None
         self.desktop_app_instance: Any = None  # 桌面應用實例引用
+        self.last_browser_launch_attempt: dict[str, Any] | None = None
 
         # 初始化標記，用於追蹤異步初始化狀態
         self._initialization_complete = False
@@ -612,12 +614,25 @@ class WebUIManager:
 
     def open_browser(self, url: str):
         """開啟瀏覽器"""
+        strategy_info = get_browser_launch_strategy()
+        browser_attempt: dict[str, Any] = {
+            "url": url,
+            "strategy": strategy_info["strategy"],
+            "helper_path": strategy_info["helper_path"],
+            "success": False,
+            "error": None,
+            "timestamp": time.time(),
+        }
         try:
             browser_opener = get_browser_opener()
             browser_opener(url)
+            browser_attempt["success"] = True
             debug_log(f"已開啟瀏覽器：{url}")
         except Exception as e:
+            browser_attempt["error"] = str(e)
             debug_log(f"無法開啟瀏覽器: {e}")
+        finally:
+            self.last_browser_launch_attempt = browser_attempt
 
     async def smart_open_browser(self, url: str) -> bool:
         """智能開啟瀏覽器 - 檢測是否已有活躍標籤頁
@@ -629,6 +644,14 @@ class WebUIManager:
         try:
             # 檢查是否為桌面模式
             if os.environ.get("MCP_DESKTOP_MODE", "").lower() == "true":
+                self.last_browser_launch_attempt = {
+                    "url": url,
+                    "strategy": "desktop_mode_skip",
+                    "helper_path": None,
+                    "success": True,
+                    "error": None,
+                    "timestamp": time.time(),
+                }
                 debug_log("檢測到桌面模式，跳過瀏覽器開啟")
                 return True
 
@@ -641,6 +664,16 @@ class WebUIManager:
 
                 # 向現有標籤頁發送刷新通知
                 refresh_success = await self.notify_existing_tab_to_refresh()
+                self.last_browser_launch_attempt = {
+                    "url": url,
+                    "strategy": "active_tab_refresh",
+                    "helper_path": None,
+                    "success": refresh_success,
+                    "error": None
+                    if refresh_success
+                    else "existing tab refresh notification failed",
+                    "timestamp": time.time(),
+                }
 
                 debug_log(f"刷新通知發送結果: {refresh_success}")
                 debug_log("檢測到活躍標籤頁，不開啟新瀏覽器視窗")

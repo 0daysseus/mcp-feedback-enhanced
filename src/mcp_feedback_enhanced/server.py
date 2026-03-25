@@ -16,6 +16,7 @@ MCP Feedback Enhanced 伺服器主要模組
 
 主要 MCP 工具：
 - interactive_feedback: 收集用戶互動回饋
+- telegram_feedback: 收集 Telegram 回饋
 - get_system_info: 獲取系統環境資訊
 
 作者: Fábio Ferreira (原作者)
@@ -27,7 +28,11 @@ import base64
 import io
 import json
 import os
+import subprocess
 import sys
+import threading
+import time
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
@@ -37,6 +42,21 @@ from pydantic import Field
 
 # 導入統一的調試功能
 from .debug import server_debug_log as debug_log
+from .feedback_routing import is_user_away
+from .telegram import (
+    TelegramBotClient,
+    TelegramClientError,
+    TelegramFeedbackCancelled,
+    TelegramFeedbackSession,
+    build_completion_confirmation_keyboard,
+    create_completion_confirmation_request,
+    create_pending_feedback_request,
+    discard_pending_feedback_request,
+    register_completion_confirmation_message,
+    register_pending_feedback_message,
+    wait_for_completion_confirmation,
+    wait_for_pending_feedback,
+)
 
 # 導入多語系支援
 # 導入錯誤處理框架
@@ -44,6 +64,7 @@ from .utils.error_handler import ErrorHandler, ErrorType
 
 # 導入資源管理器
 from .utils.resource_manager import create_temp_file
+from .web.utils.browser import find_remote_browser_helper
 
 
 # ===== 編碼初始化 =====
@@ -52,7 +73,7 @@ def init_encoding():
     try:
         # Windows 特殊處理
         if sys.platform == "win32":
-            import msvcrt
+            import msvcrt  # noqa: PLC0415
 
             # 設置為二進制模式
             msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
@@ -111,6 +132,19 @@ _encoding_initialized = init_encoding()
 SERVER_NAME = "互動式回饋收集 MCP"
 SSH_ENV_VARS = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
 REMOTE_ENV_VARS = ["REMOTE_CONTAINERS", "CODESPACES"]
+REQUIRED_TELEGRAM_COMMANDS = [
+    {"command": "done", "description": "Submit feedback"},
+]
+MANAGED_TELEGRAM_COMMAND_NAMES = {"done", "cancel"}
+DEFAULT_FEEDBACK_TIMEOUT = 600
+FEEDBACK_TIMEOUT_ENV_VAR = "MCP_FEEDBACK_TIMEOUT"
+TELEGRAM_GATEWAY_RESTART_DELAY_SECONDS = 5.0
+_http_telegram_gateway_thread: threading.Thread | None = None
+_http_telegram_gateway_lock = threading.Lock()
+
+
+class InteractiveFeedbackPrerequisiteError(RuntimeError):
+    """Raised when interactive feedback cannot run in the current environment."""
 
 
 # 初始化 MCP 服務器
@@ -262,6 +296,120 @@ def save_feedback_to_file(feedback_data: dict, file_path: str | None = None) -> 
 
     debug_log(f"回饋資料已儲存至: {file_path}")
     return file_path
+
+
+def _find_git_repo_root(start_path: Path) -> Path | None:
+    """Find the nearest git repository root from a starting path."""
+    resolved_path = start_path.resolve()
+
+    for candidate in (resolved_path, *resolved_path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+
+    return None
+
+
+def _run_git_command(repo_root: Path, args: list[str]) -> str:
+    """Run a git command in the given repository and return stripped stdout."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        error_message = result.stderr.strip() or result.stdout.strip() or "git command failed"
+        raise RuntimeError(error_message)
+
+    return result.stdout.rstrip("\n")
+
+
+def _collect_source_debug_info() -> dict[str, Any]:
+    """Collect source location and git metadata for runtime debugging."""
+    server_file = Path(__file__).resolve()
+    package_root = server_file.parent
+    source_info: dict[str, Any] = {
+        "來源模式": "packaged_copy",
+        "server_file": str(server_file),
+        "package_root": str(package_root),
+        "git_repo_root": None,
+        "git_commit": None,
+        "git_branch": None,
+        "git_dirty": None,
+        "git_status_short": None,
+    }
+
+    repo_root = _find_git_repo_root(package_root)
+    if repo_root is None:
+        return source_info
+
+    source_info["來源模式"] = "git_worktree"
+    source_info["git_repo_root"] = str(repo_root.resolve())
+
+    try:
+        git_commit = _run_git_command(repo_root, ["rev-parse", "HEAD"])
+        git_branch = _run_git_command(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
+        git_status_short = _run_git_command(repo_root, ["status", "--short"])
+    except Exception as exc:
+        source_info["git_error"] = str(exc)
+        return source_info
+
+    source_info["git_commit"] = git_commit
+    source_info["git_branch"] = git_branch
+    source_info["git_dirty"] = bool(git_status_short)
+    source_info["git_status_short"] = git_status_short
+
+    return source_info
+
+
+def _collect_browser_runtime_debug_info(manager: Any | None = None) -> dict[str, Any]:
+    """Collect browser-launch diagnostics for the current runtime."""
+    browser_info: dict[str, Any] = {
+        "home": str(Path.home()),
+        "browser_env": os.getenv("BROWSER"),
+        "remote_browser_helper": find_remote_browser_helper(),
+        "webui_manager_initialized": False,
+        "has_current_session": False,
+        "current_session_id": None,
+        "current_session_has_websocket": False,
+        "current_session_last_heartbeat": None,
+        "global_active_tabs_count": 0,
+        "pending_session_update": False,
+        "last_browser_launch_attempt": None,
+    }
+
+    try:
+        if manager is None:
+            from .web import main as web_main  # noqa: PLC0415
+
+            manager = getattr(web_main, "_web_ui_manager", None)
+
+        if manager is None:
+            return browser_info
+
+        session = manager.get_current_session()
+        browser_info["webui_manager_initialized"] = True
+        browser_info["has_current_session"] = session is not None
+        browser_info["global_active_tabs_count"] = manager.get_global_active_tabs_count()
+        browser_info["pending_session_update"] = getattr(
+            manager, "_pending_session_update", False
+        )
+        browser_info["last_browser_launch_attempt"] = getattr(
+            manager, "last_browser_launch_attempt", None
+        )
+
+        if session is not None:
+            browser_info["current_session_id"] = session.session_id
+            browser_info["current_session_has_websocket"] = session.websocket is not None
+            browser_info["current_session_last_heartbeat"] = getattr(
+                session, "last_heartbeat", None
+            )
+
+    except Exception as exc:
+        browser_info["browser_runtime_error"] = str(exc)
+
+    return browser_info
 
 
 def create_feedback_text(feedback_data: dict) -> str:
@@ -425,14 +573,274 @@ def process_images(images_data: list[dict]) -> list[MCPImage]:
     return mcp_images
 
 
+def build_feedback_items(result: dict | None) -> list:
+    """Build MCP feedback items from a channel result payload."""
+    if not result:
+        return [TextContent(type="text", text="用戶取消了回饋。")]
+
+    feedback_items = []
+
+    if (
+        result.get("interactive_feedback")
+        or result.get("command_logs")
+        or result.get("images")
+    ):
+        feedback_text = create_feedback_text(result)
+        feedback_items.append(TextContent(type="text", text=feedback_text))
+        debug_log("文字回饋已添加")
+
+    if result.get("images"):
+        mcp_images = process_images(result["images"])
+        feedback_items.extend(mcp_images)
+        debug_log(f"已添加 {len(mcp_images)} 張圖片")
+
+    if not feedback_items:
+        feedback_items.append(TextContent(type="text", text="用戶未提供任何回饋內容。"))
+
+    return feedback_items
+
+
+def _resolve_feedback_timeout() -> int:
+    """Resolve feedback timeout from environment.
+
+    Timeout is controlled by ``MCP_FEEDBACK_TIMEOUT`` only.
+    Invalid, empty, or non-positive values fall back to default timeout.
+    """
+    raw_timeout = os.getenv(FEEDBACK_TIMEOUT_ENV_VAR, "").strip()
+    if not raw_timeout:
+        return DEFAULT_FEEDBACK_TIMEOUT
+
+    try:
+        timeout = int(raw_timeout)
+    except ValueError:
+        debug_log(
+            f"{FEEDBACK_TIMEOUT_ENV_VAR} 值無效 ({raw_timeout})，使用預設值 {DEFAULT_FEEDBACK_TIMEOUT}"
+        )
+        return DEFAULT_FEEDBACK_TIMEOUT
+
+    if timeout <= 0:
+        debug_log(
+            f"{FEEDBACK_TIMEOUT_ENV_VAR} 值必須大於 0 ({timeout})，使用預設值 {DEFAULT_FEEDBACK_TIMEOUT}"
+        )
+        return DEFAULT_FEEDBACK_TIMEOUT
+
+    return timeout
+
+
+def _normalize_project_directory(project_directory: str) -> str:
+    """Normalize a project directory argument to an absolute existing path."""
+    if not os.path.exists(project_directory):
+        project_directory = os.getcwd()
+    return os.path.abspath(project_directory)
+
+
+def _build_interactive_feedback_away_message() -> str:
+    """Build retry guidance for away mode."""
+    return (
+        "interactive_feedback 当前已被 away 模式禁用。\n"
+        "请直接调用 telegram_feedback 工具继续收集反馈。"
+    )
+
+
+def _build_interactive_feedback_timeout_message(timeout: int) -> str:
+    """Build retry guidance for interactive feedback web timeouts."""
+    return (
+        "interactive_feedback 首次尝试通过 Web UI 收集反馈已超时 (timeout)."
+        f"等待 {timeout} 秒后仍未收到用户回复。\n"
+        "请改为调用 telegram_feedback 工具继续收集反馈。"
+    )
+
+
+def _build_completion_confirmation_prompt(summary: str, project_directory: str) -> str:
+    """Build the Telegram message used for task-completion confirmation."""
+    return (
+        "Task completion check:\n"
+        f"{summary}\n\n"
+        "Project directory:\n"
+        f"{project_directory}\n\n"
+        "Should the agent stop now?"
+    )
+
+
+async def ensure_telegram_commands(client: TelegramBotClient) -> None:
+    """Ensure the Telegram bot exposes the slash commands used by the feedback flow."""
+    current_commands = await client.get_commands()
+    required_names = {command["command"] for command in REQUIRED_TELEGRAM_COMMANDS}
+    merged_commands: list[dict[str, str]] = []
+    command_index: dict[str, dict[str, str]] = {}
+
+    for command in current_commands:
+        if not isinstance(command, dict):
+            continue
+
+        name = command.get("command")
+        if not isinstance(name, str) or not name:
+            continue
+        if name in MANAGED_TELEGRAM_COMMAND_NAMES and name not in required_names:
+            continue
+
+        description = command.get("description")
+        normalized_command = {
+            "command": name,
+            "description": description if isinstance(description, str) else "",
+        }
+        merged_commands.append(normalized_command)
+        command_index[name] = normalized_command
+
+    needs_update = any(
+        isinstance(command, dict)
+        and isinstance(command.get("command"), str)
+        and command["command"] in MANAGED_TELEGRAM_COMMAND_NAMES
+        and command["command"] not in required_names
+        for command in current_commands
+    )
+    for required_command in REQUIRED_TELEGRAM_COMMANDS:
+        existing_command = command_index.get(required_command["command"])
+        if existing_command is None:
+            merged_commands.append(dict(required_command))
+            needs_update = True
+            continue
+
+        if existing_command["description"] != required_command["description"]:
+            existing_command["description"] = required_command["description"]
+            needs_update = True
+
+    if needs_update:
+        await client.set_commands(merged_commands)
+        debug_log("Telegram commands registered or updated")
+    else:
+        debug_log("Telegram commands already up to date")
+
+
 # ===== MCP 工具定義 =====
+async def _interactive_feedback_impl(
+    project_directory: str,
+    summary: str,
+    *,
+    raise_on_timeout: bool = False,
+) -> list:
+    """Collect feedback through Web UI, optionally surfacing timeout for fallback."""
+    is_remote = is_remote_environment()
+    is_wsl = is_wsl_environment()
+
+    debug_log(f"環境偵測結果 - 遠端: {is_remote}, WSL: {is_wsl}")
+    debug_log("使用介面: Web UI")
+
+    project_directory = _normalize_project_directory(project_directory)
+    timeout = _resolve_feedback_timeout()
+
+    try:
+        from fastmcp.server.dependencies import get_http_headers  # noqa: PLC0415
+
+        from .utils.request_env import (  # noqa: PLC0415
+            extract_browser_env_overrides_from_headers,
+            request_env_overrides,
+        )
+
+        debug_log("回饋模式: web")
+
+        headers = get_http_headers()
+        env_overrides = extract_browser_env_overrides_from_headers(headers)
+        if env_overrides:
+            debug_log(
+                "從 HTTP headers 套用瀏覽器環境變數覆寫: "
+                f"{sorted(env_overrides.keys())}"
+            )
+
+        desktop_mode = os.getenv("MCP_DESKTOP_MODE", "").lower() == "true"
+        display_env = os.getenv("DISPLAY", "").strip()
+
+        if is_remote and not is_wsl and not desktop_mode and not display_env:
+            browser_env = (
+                env_overrides.get("BROWSER") or os.getenv("BROWSER", "")
+            ).strip()
+            vscode_ipc_hook = (
+                env_overrides.get("VSCODE_IPC_HOOK_CLI")
+                or os.getenv("VSCODE_IPC_HOOK_CLI", "")
+            ).strip()
+            missing_vars: list[str] = []
+            if not browser_env:
+                missing_vars.append("BROWSER")
+            if not vscode_ipc_hook:
+                missing_vars.append("VSCODE_IPC_HOOK_CLI")
+
+            if missing_vars:
+                missing_str = ", ".join(missing_vars)
+                raise InteractiveFeedbackPrerequisiteError(
+                    "interactive_feedback 在当前远端/无 DISPLAY 环境不可用："
+                    f"缺少环境变量 {missing_str}，无法启动本地浏览器。\n"
+                    "请改用 telegram_feedback 工具作为回退反馈通道。\n"
+                    "（可先调用 get_system_info 查看当前 MCP 进程环境变量。）"
+                )
+
+        with request_env_overrides(env_overrides):
+            result = await launch_web_feedback_ui(project_directory, summary, timeout)
+
+        if result:
+            save_feedback_to_file(result)
+        feedback_items = build_feedback_items(result)
+
+        debug_log(f"回饋收集完成，共 {len(feedback_items)} 個項目")
+        return feedback_items
+
+    except InteractiveFeedbackPrerequisiteError:
+        raise
+    except TimeoutError as exc:
+        if raise_on_timeout:
+            raise RuntimeError(_build_interactive_feedback_timeout_message(timeout)) from exc
+
+        error_id = ErrorHandler.log_error_with_context(
+            exc,
+            context={"operation": "回饋收集", "project_dir": project_directory},
+            error_type=ErrorType.TIMEOUT,
+        )
+        user_error_msg = ErrorHandler.format_user_error(exc, include_technical=False)
+        debug_log(f"回饋收集錯誤 [錯誤ID: {error_id}]: {exc!s}")
+        return [TextContent(type="text", text=user_error_msg)]
+    except Exception as e:
+        error_id = ErrorHandler.log_error_with_context(
+            e,
+            context={"operation": "回饋收集", "project_dir": project_directory},
+            error_type=ErrorType.SYSTEM,
+        )
+        user_error_msg = ErrorHandler.format_user_error(e, include_technical=False)
+        debug_log(f"回饋收集錯誤 [錯誤ID: {error_id}]: {e!s}")
+        return [TextContent(type="text", text=user_error_msg)]
+
+
+async def _telegram_feedback_impl(project_directory: str, summary: str) -> list:
+    """Collect feedback through Telegram."""
+    project_directory = _normalize_project_directory(project_directory)
+
+    try:
+        debug_log("回饋模式: telegram")
+        timeout = _resolve_feedback_timeout()
+        result = await launch_telegram_feedback(project_directory, summary, timeout)
+
+        if result:
+            save_feedback_to_file(result)
+
+        feedback_items = build_feedback_items(result)
+        debug_log(f"Telegram 回饋收集完成，共 {len(feedback_items)} 個項目")
+        return feedback_items
+
+    except Exception as e:
+        error_id = ErrorHandler.log_error_with_context(
+            e,
+            context={"operation": "Telegram 回饋收集", "project_dir": project_directory},
+            error_type=ErrorType.SYSTEM,
+        )
+        user_error_msg = ErrorHandler.format_user_error(e, include_technical=False)
+        debug_log(f"Telegram 回饋收集錯誤 [錯誤ID: {error_id}]: {e!s}")
+        return [TextContent(type="text", text=user_error_msg)]
+
+
 @mcp.tool()
 async def interactive_feedback(
     project_directory: Annotated[str, Field(description="專案目錄路徑")] = ".",
     summary: Annotated[
         str, Field(description="AI 工作完成的摘要說明")
     ] = "我已完成了您請求的任務。",
-    timeout: Annotated[int, Field(description="等待用戶回饋的超時時間（秒）")] = 600,
 ) -> list:
     """Interactive feedback collection tool for LLM agents.
 
@@ -446,78 +854,19 @@ async def interactive_feedback(
     Args:
         project_directory: Project directory path for context
         summary: Summary of AI work completed for user review
-        timeout: Timeout in seconds for waiting user feedback (default: 600 seconds)
+        Timeout is configured via MCP_FEEDBACK_TIMEOUT environment variable (default: 600 seconds)
 
     Returns:
         list: List containing TextContent and MCPImage objects representing user feedback
     """
-    # 環境偵測
-    is_remote = is_remote_environment()
-    is_wsl = is_wsl_environment()
+    if is_user_away():
+        raise RuntimeError(_build_interactive_feedback_away_message())
 
-    debug_log(f"環境偵測結果 - 遠端: {is_remote}, WSL: {is_wsl}")
-    debug_log("使用介面: Web UI")
-
-    try:
-        # 確保專案目錄存在
-        if not os.path.exists(project_directory):
-            project_directory = os.getcwd()
-        project_directory = os.path.abspath(project_directory)
-
-        # 使用 Web 模式
-        debug_log("回饋模式: web")
-
-        result = await launch_web_feedback_ui(project_directory, summary, timeout)
-
-        # 處理取消情況
-        if not result:
-            return [TextContent(type="text", text="用戶取消了回饋。")]
-
-        # 儲存詳細結果
-        save_feedback_to_file(result)
-
-        # 建立回饋項目列表
-        feedback_items = []
-
-        # 添加文字回饋
-        if (
-            result.get("interactive_feedback")
-            or result.get("command_logs")
-            or result.get("images")
-        ):
-            feedback_text = create_feedback_text(result)
-            feedback_items.append(TextContent(type="text", text=feedback_text))
-            debug_log("文字回饋已添加")
-
-        # 添加圖片回饋
-        if result.get("images"):
-            mcp_images = process_images(result["images"])
-            # 修復 arg-type 錯誤 - 直接擴展列表
-            feedback_items.extend(mcp_images)
-            debug_log(f"已添加 {len(mcp_images)} 張圖片")
-
-        # 確保至少有一個回饋項目
-        if not feedback_items:
-            feedback_items.append(
-                TextContent(type="text", text="用戶未提供任何回饋內容。")
-            )
-
-        debug_log(f"回饋收集完成，共 {len(feedback_items)} 個項目")
-        return feedback_items
-
-    except Exception as e:
-        # 使用統一錯誤處理，但不影響 JSON RPC 響應
-        error_id = ErrorHandler.log_error_with_context(
-            e,
-            context={"operation": "回饋收集", "project_dir": project_directory},
-            error_type=ErrorType.SYSTEM,
-        )
-
-        # 生成用戶友好的錯誤信息
-        user_error_msg = ErrorHandler.format_user_error(e, include_technical=False)
-        debug_log(f"回饋收集錯誤 [錯誤ID: {error_id}]: {e!s}")
-
-        return [TextContent(type="text", text=user_error_msg)]
+    return await _interactive_feedback_impl(
+        project_directory,
+        summary,
+        raise_on_timeout=True,
+    )
 
 
 async def launch_web_feedback_ui(project_dir: str, summary: str, timeout: int) -> dict:
@@ -536,7 +885,7 @@ async def launch_web_feedback_ui(project_dir: str, summary: str, timeout: int) -
 
     try:
         # 使用新的 web 模組
-        from .web import launch_web_feedback_ui as web_launch
+        from .web import launch_web_feedback_ui as web_launch  # noqa: PLC0415
 
         # 傳遞 timeout 參數給 Web UI
         return await web_launch(project_dir, summary, timeout)
@@ -559,6 +908,140 @@ async def launch_web_feedback_ui(project_dir: str, summary: str, timeout: int) -
         }
 
 
+async def launch_telegram_feedback(project_dir: str, summary: str, timeout: int) -> dict:
+    """
+    啟動 Telegram Bot 回饋收集。
+
+    Args:
+        project_dir: 專案目錄路徑
+        summary: AI 工作摘要
+        timeout: 超時時間（秒）
+
+    Returns:
+        dict: 收集到的回饋資料
+    """
+    debug_log(f"啟動 Telegram 回饋，超時時間: {timeout} 秒")
+
+    try:
+        session = TelegramFeedbackSession.from_environment(summary, project_dir)
+        client = TelegramBotClient(
+            token=session.bot_token,
+            api_base=session.api_base,
+        )
+
+        prompt_text = (
+            "AI 工作摘要:\n"
+            f"{summary}\n\n"
+            "專案目錄:\n"
+            f"{project_dir}\n\n"
+            "請直接回覆文字與圖片。\n"
+            "送出請輸入 /done"
+        )
+        if _http_telegram_gateway_is_running():
+            request = create_pending_feedback_request(
+                session.chat_id,
+                project_dir,
+                summary,
+            )
+            try:
+                response = await client.send_message(session.chat_id, prompt_text)
+            except Exception:
+                discard_pending_feedback_request(request.request_id)
+                raise
+
+            message_id = response.get("message_id") if isinstance(response, dict) else None
+            register_pending_feedback_message(request.request_id, message_id)
+            return await wait_for_pending_feedback(request, timeout)
+
+        await client.send_message(session.chat_id, prompt_text)
+        return await session.collect_feedback(client, timeout)
+    except ValueError as e:
+        debug_log(f"Telegram 配置錯誤: {e}")
+        return {
+            "command_logs": "",
+            "interactive_feedback": str(e),
+            "images": [],
+        }
+    except TelegramClientError as e:
+        debug_log(f"Telegram API 錯誤: {e}")
+        return {
+            "command_logs": "",
+            "interactive_feedback": str(e),
+            "images": [],
+        }
+    except TelegramFeedbackCancelled:
+        debug_log("Telegram 回饋已取消")
+        return {}
+
+
+@mcp.tool()
+async def telegram_feedback(
+    project_directory: Annotated[str, Field(description="專案目錄路徑")] = ".",
+    summary: Annotated[
+        str, Field(description="AI 工作完成的摘要說明")
+    ] = "我已完成了您請求的任務。",
+) -> list:
+    """Telegram feedback collection tool for LLM agents --- yet another feedback channel option which can 100% guarantee that humans can see your feedback..
+
+        Call this when interactive_feedback is not available (e.g. in away mode, or when Web UI feedback times out), or you want to ensure that users will see your feedback and provide response through Telegram.
+    """
+    return await _telegram_feedback_impl(project_directory, summary)
+
+
+@mcp.tool()
+async def telegram_confirm_completion(
+    project_directory: Annotated[str, Field(description="專案目錄路徑")] = ".",
+    summary: Annotated[
+        str, Field(description="AI 工作完成的摘要說明")
+    ] = "The requested work is finished.",
+) -> dict[str, object]:
+    """Ask the Telegram user whether the agent may stop the current task (mark as complete)."""
+    project_directory = _normalize_project_directory(project_directory)
+    timeout_seconds = _resolve_feedback_timeout()
+
+    try:
+        session = TelegramFeedbackSession.from_environment(summary, project_directory)
+        client = TelegramBotClient(
+            token=session.bot_token,
+            api_base=session.api_base,
+        )
+        request = create_completion_confirmation_request(
+            session.chat_id,
+            project_directory,
+            summary,
+        )
+        response = await client.send_message(
+            session.chat_id,
+            _build_completion_confirmation_prompt(summary, project_directory),
+            reply_markup=build_completion_confirmation_keyboard(request.request_id),
+        )
+        message_id = response.get("message_id")
+        register_completion_confirmation_message(
+            request.request_id,
+            message_id if isinstance(message_id, int) else None,
+        )
+        return await wait_for_completion_confirmation(request, timeout_seconds)
+    except (ValueError, TelegramClientError) as exc:
+        debug_log(f"Telegram 完成確認不可用: {exc}")
+        return {
+            "approved": False,
+            "decision": "unavailable",
+            "response_text": str(exc),
+        }
+    except Exception as exc:
+        error_id = ErrorHandler.log_error_with_context(
+            exc,
+            context={"operation": "Telegram 完成確認", "project_dir": project_directory},
+            error_type=ErrorType.SYSTEM,
+        )
+        debug_log(f"Telegram 完成確認錯誤 [錯誤ID: {error_id}]: {exc!s}")
+        return {
+            "approved": False,
+            "decision": "error",
+            "response_text": str(exc),
+        }
+
+
 @mcp.tool()
 def get_system_info() -> str:
     """
@@ -570,16 +1053,43 @@ def get_system_info() -> str:
     is_remote = is_remote_environment()
     is_wsl = is_wsl_environment()
 
+    headers = {}
+    env_overrides = {}
+    try:
+        from fastmcp.server.dependencies import get_http_headers  # noqa: PLC0415
+
+        from .utils.request_env import (  # noqa: PLC0415
+            extract_browser_env_overrides_from_headers,
+            request_env_overrides,
+        )
+
+        headers = get_http_headers()
+        env_overrides = extract_browser_env_overrides_from_headers(headers)
+    except Exception as exc:
+        # 僅用於調試資訊，不應影響主要 JSON 輸出
+        env_overrides = {"_error": str(exc)}
+
+    if env_overrides and "_error" not in env_overrides:
+        with request_env_overrides(env_overrides):
+            browser_debug_info = _collect_browser_runtime_debug_info()
+    else:
+        browser_debug_info = _collect_browser_runtime_debug_info()
+
     system_info = {
         "平台": sys.platform,
         "Python 版本": sys.version.split()[0],
         "WSL 環境": is_wsl,
         "遠端環境": is_remote,
         "介面類型": "Web UI",
+        "原始碼資訊": _collect_source_debug_info(),
+        "瀏覽器調試資訊": browser_debug_info,
+        "請求覆寫環境變數": env_overrides if "_error" not in env_overrides else {},
         "環境變數": {
             "SSH_CONNECTION": os.getenv("SSH_CONNECTION"),
             "SSH_CLIENT": os.getenv("SSH_CLIENT"),
             "DISPLAY": os.getenv("DISPLAY"),
+            "BROWSER": os.getenv("BROWSER"),
+            "VSCODE_IPC_HOOK_CLI": os.getenv("VSCODE_IPC_HOOK_CLI"),
             "VSCODE_INJECTION": os.getenv("VSCODE_INJECTION"),
             "SESSIONNAME": os.getenv("SESSIONNAME"),
             "WSL_DISTRO_NAME": os.getenv("WSL_DISTRO_NAME"),
@@ -636,7 +1146,11 @@ def main():
 
     try:
         # 使用正確的 FastMCP API
-        mcp.run()
+        run_mcp_server(
+            transport=os.getenv("MCP_TRANSPORT", "stdio"),
+            host=os.getenv("MCP_HTTP_HOST", "127.0.0.1"),
+            port=int(os.getenv("MCP_HTTP_PORT", "8000")),
+        )
     except KeyboardInterrupt:
         if debug_enabled:
             debug_log("收到中斷信號，正常退出")
@@ -644,10 +1158,91 @@ def main():
     except Exception as e:
         if debug_enabled:
             debug_log(f"MCP 服務器啟動失敗: {e}")
-            import traceback
+            import traceback  # noqa: PLC0415
 
             debug_log(f"詳細錯誤: {traceback.format_exc()}")
         sys.exit(1)
+
+def run_mcp_server(
+    transport: str = "stdio",
+    host: str | None = None,
+    port: int | None = None,
+) -> None:
+    """Run the FastMCP server with the requested transport."""
+    if transport == "http":
+        maybe_start_http_telegram_gateway()
+        mcp.run(transport="http", host=host, port=port)
+        return
+
+    mcp.run()
+
+
+def _telegram_gateway_env_is_configured() -> bool:
+    bot_token = os.getenv("MCP_TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("MCP_TELEGRAM_CHAT_ID", "").strip()
+    return bool(bot_token and chat_id)
+
+
+def _http_telegram_gateway_is_running() -> bool:
+    thread = _http_telegram_gateway_thread
+    return thread is not None and thread.is_alive()
+
+
+def _run_http_telegram_gateway_with_restart(
+    run_gateway_func: Any,
+    *,
+    sleep_func: Any = time.sleep,
+    restart_delay: float = TELEGRAM_GATEWAY_RESTART_DELAY_SECONDS,
+) -> None:
+    """Run the HTTP transport Telegram gateway and restart it after crashes."""
+    while True:
+        try:
+            run_gateway_func()
+            return
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            debug_log(f"HTTP transport Telegram gateway stopped: {exc}")
+            debug_log(
+                "HTTP transport Telegram gateway will restart "
+                f"in {restart_delay:.1f}s"
+            )
+            sleep_func(restart_delay)
+
+
+def _run_http_telegram_gateway() -> None:
+    from .telegram.gateway import run_gateway  # noqa: PLC0415
+
+    _run_http_telegram_gateway_with_restart(run_gateway)
+
+
+def maybe_start_http_telegram_gateway() -> bool:
+    """Start the Telegram gateway alongside HTTP transport when configured."""
+    global _http_telegram_gateway_thread
+
+    if not _telegram_gateway_env_is_configured():
+        debug_log(
+            "Telegram gateway auto-start skipped: missing MCP_TELEGRAM_BOT_TOKEN or MCP_TELEGRAM_CHAT_ID"
+        )
+        return False
+
+    with _http_telegram_gateway_lock:
+        if (
+            _http_telegram_gateway_thread is not None
+            and _http_telegram_gateway_thread.is_alive()
+        ):
+            debug_log(
+                "Telegram gateway auto-start skipped: background gateway is already running"
+            )
+            return False
+
+        gateway_thread = threading.Thread(
+            target=_run_http_telegram_gateway,
+            name="mcp-feedback-http-telegram-gateway",
+            daemon=True,
+        )
+        gateway_thread.start()
+        _http_telegram_gateway_thread = gateway_thread
+        debug_log("Started Telegram gateway in the background for HTTP transport")
+        return True
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ class TestData:
             "enable_base64_detail": True
         }
     }
-    
+
     # 測試圖片數據（Base64 編碼的小圖片）
     SAMPLE_IMAGE_BASE64: str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 
@@ -56,7 +56,7 @@ class TestData:
             }
         }
     }
-    
+
     # I18N 測試數據
     I18N_TEST_KEYS: List[str] = [
         "common.submit",
@@ -77,7 +77,15 @@ class TestData:
     TEST_ENV_VARS: Dict[str, str] = {
         "MCP_DEBUG": "true",
         "MCP_WEB_PORT": "8765",
-        "MCP_TEST_MODE": "true"
+        "MCP_TEST_MODE": "true",
+        "MCP_TELEGRAM_BOT_TOKEN": "test-telegram-token",
+        "MCP_TELEGRAM_CHAT_ID": "123456789",
+    }
+
+    TELEGRAM_TEST_CONFIG: Dict[str, str] = {
+        "bot_token": "test-telegram-token",
+        "chat_id": "123456789",
+        "api_base": "https://api.telegram.org",
     }
 
     # 測試配置
@@ -100,7 +108,7 @@ class TestData:
 
 class MockResponses:
     """模擬回應數據"""
-    
+
     @staticmethod
     def successful_feedback_response() -> Dict[str, Any]:
         """成功的回饋回應"""
@@ -109,7 +117,7 @@ class MockResponses:
             "interactive_feedback": "用戶確認：功能正常運作",
             "images": []
         }
-    
+
     @staticmethod
     def feedback_with_images_response() -> Dict[str, Any]:
         """包含圖片的回饋回應"""
@@ -124,7 +132,7 @@ class MockResponses:
                 }
             ]
         }
-    
+
     @staticmethod
     def timeout_response() -> Dict[str, Any]:
         """超時回應"""
@@ -133,7 +141,7 @@ class MockResponses:
             "interactive_feedback": "用戶回饋超時，使用默認行為",
             "images": []
         }
-    
+
     @staticmethod
     def error_response(error_message: str) -> Dict[str, Any]:
         """錯誤回應"""
@@ -143,7 +151,7 @@ class MockResponses:
             "interactive_feedback": "",
             "images": []
         }
-    
+
     @staticmethod
     def mcp_initialize_response() -> Dict[str, Any]:
         """MCP 初始化回應"""
@@ -163,7 +171,7 @@ class MockResponses:
                 }
             }
         }
-    
+
     @staticmethod
     def mcp_tools_list_response() -> Dict[str, Any]:
         """MCP 工具列表回應"""
@@ -183,12 +191,8 @@ class MockResponses:
                                     "description": "專案目錄路徑"
                                 },
                                 "summary": {
-                                    "type": "string", 
+                                    "type": "string",
                                     "description": "AI 工作完成的摘要說明"
-                                },
-                                "timeout": {
-                                    "type": "integer",
-                                    "description": "等待用戶回饋的超時時間（秒）"
                                 }
                             }
                         }
@@ -200,7 +204,7 @@ class MockResponses:
 
 class TestScenarios:
     """測試場景數據"""
-    
+
     BASIC_WORKFLOW = {
         "name": "basic_workflow",
         "description": "基本 MCP 工作流程測試",
@@ -216,7 +220,7 @@ class TestScenarios:
             "response_format_valid": True
         }
     }
-    
+
     WEB_UI_TEST = {
         "name": "web_ui_startup",
         "description": "Web UI 啟動測試",
@@ -232,7 +236,7 @@ class TestScenarios:
             "websocket_available": True
         }
     }
-    
+
     I18N_TEST = {
         "name": "i18n_functionality",
         "description": "國際化功能測試",

@@ -90,7 +90,11 @@ class SimpleMCPClient:
     async def call_interactive_feedback(
         self, project_directory: str, summary: str, timeout: int = 30
     ) -> dict[str, Any]:
-        """調用 interactive_feedback 工具"""
+        """調用 interactive_feedback 工具。
+
+        Note:
+            ``timeout`` 僅用於客戶端等待 MCP 回應的時間，不會作為工具參數發送。
+        """
         if not self.initialized:
             return {"error": "MCP 客戶端未初始化"}
 
@@ -104,7 +108,6 @@ class SimpleMCPClient:
                     "arguments": {
                         "project_directory": project_directory,
                         "summary": summary,
-                        "timeout": timeout,
                     },
                 },
             }

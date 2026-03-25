@@ -172,8 +172,13 @@ follow mcp-feedback-enhanced instructions
 | `MCP_DEBUG` | Debug mode | `true`/`false` | `false` |
 | `MCP_WEB_HOST` | Web UI host binding | IP address or hostname | `127.0.0.1` |
 | `MCP_WEB_PORT` | Web UI port | `1024-65535` | `8765` |
+| `MCP_FEEDBACK_TIMEOUT` | `interactive_feedback` / `telegram_feedback` / `telegram_confirm_completion` wait timeout (env-only) | Positive integer (seconds) | `600` |
 | `MCP_DESKTOP_MODE` | Desktop application mode | `true`/`false` | `false` |
 | `MCP_LANGUAGE` | Force UI language | `zh-TW`/`zh-CN`/`en` | Auto-detect |
+| `MCP_TELEGRAM_BOT_TOKEN` | Telegram Bot token for fallback feedback | Telegram bot token string | Disabled |
+| `MCP_TELEGRAM_CHAT_ID` | Fixed Telegram chat id for fallback feedback | Fixed Telegram chat id | Disabled |
+| `MCP_TELEGRAM_DISABLE_SSL_VERIFY` | Disable Telegram TLS verification in broken local CA environments | `true`/`false` | `false` |
+| `MCP_CODEX_ROOT` | Root directory exposed to Telegram gateway browsing | Absolute directory path | `/home/kube` |
 
 **`MCP_WEB_HOST` Explanation**:
 - `127.0.0.1` (default): Local access only, higher security
@@ -191,6 +196,73 @@ follow mcp-feedback-enhanced instructions
   3. System environment variables (LANG, LC_ALL, etc.)
   4. System default language
   5. Fallback to default language (Traditional Chinese)
+
+**`MCP_FEEDBACK_TIMEOUT` Explanation**:
+- Controls how long `interactive_feedback`, `telegram_feedback`, and `telegram_confirm_completion` wait for user feedback.
+- This timeout is configured only via environment variable and is not accepted as a tool argument.
+
+### Telegram Fallback Tool
+
+When the user is away from the computer, AI agents can explicitly call the new `telegram_feedback` MCP tool as a manual fallback channel.
+
+- Required environment variables:
+  - `MCP_TELEGRAM_BOT_TOKEN`
+  - `MCP_TELEGRAM_CHAT_ID`
+- Behavior:
+  - The tool sends the current `summary` and `project_directory` to the configured Telegram chat
+  - The user can reply with text and images
+  - The user sends `/done` to submit or `/cancel` to abort
+- Scope:
+  - `telegram_feedback` is an extra fallback tool
+  - Non-Telegram tasks should still call `interactive_feedback` first when the user is at the computer
+  - If the first `interactive_feedback` attempt times out, it now raises an error that explicitly tells the agent to retry with `telegram_feedback`
+  - If away mode is enabled, `interactive_feedback` raises immediately and tells the agent to use `telegram_feedback`
+  - First version only supports a fixed `MCP_TELEGRAM_CHAT_ID`
+  - First version only supports text and image replies
+  - Telegram command execution and command-log interaction are not supported
+
+### Telegram Gateway Mode
+
+Use Telegram as a remote control plane for Codex jobs:
+
+```bash
+uvx --from git+https://github.com/0daysseus/mcp-feedback-enhanced.git@main \
+  mcp-feedback-enhanced telegram-gateway
+```
+
+These slash commands are handled by the Telegram gateway loop. If you are only running the MCP server over plain stdio, the bot will not reply to `/away`, `/sessions`, `/submit`, `/resume`, `/steer`, or `/tasks`.
+
+- Supported Telegram slash commands:
+  - `/away`: toggle whether you are away from the computer; the command description changes with the current state
+  - `/submit`: browse directories, then send a new Codex task
+  - `/resume`: pick a resumable Codex session, then send a follow-up prompt
+  - `/steer`: collect follow-up text, then choose a loaded session to continue
+  - `/sessions`: list resumable Codex sessions under the allowed root
+  - `/tasks`: list loaded Codex sessions currently retained by the gateway
+  - `/cancel`: cancel the current Telegram gateway interaction
+- Behavior:
+  - `/away` toggles the persisted away state used by `interactive_feedback`; `/away on` and `/away off` are also supported for explicit control
+  - Directory browsing is restricted to `MCP_CODEX_ROOT` and hides dot-prefixed directories
+  - `/submit` injects extra instructions so Codex must call `telegram_feedback` before finishing
+  - `/submit` assumes your Codex configuration already includes an `mcp-feedback-enhanced` MCP server that exposes `telegram_feedback`; the gateway process itself does not expose MCP tools to Codex
+  - Gateway talks to `codex app-server --listen stdio://` over JSONL, uses `thread/list` for `/sessions`, `thread/start` for new tasks, `thread/resume` for `/resume`, and `turn/start` to drive execution
+  - `/sessions` and `/resume` show live Codex thread history from app-server instead of maintaining a separate local session registry
+  - Completed or resumed gateway sessions remain loaded so `/tasks` can show them and `/steer` can continue them later
+  - `/steer` collects one or more plain-text follow-up messages until `/done`, then prompts you to pick a loaded session; active sessions use `turn/steer`, idle loaded sessions start a new turn on the same thread
+  - Final Telegram completion messages include the last Codex result and usage when available
+
+### MCP Server Over HTTP
+
+The MCP server still defaults to stdio, but can also listen over Streamable HTTP:
+
+```bash
+uvx --from git+https://github.com/0daysseus/mcp-feedback-enhanced.git@main \
+  mcp-feedback-enhanced server --transport http --host 127.0.0.1 --port 8000
+```
+
+FastMCP uses the default Streamable HTTP endpoint shape, so clients should connect to `/mcp/`.
+
+When `MCP_TELEGRAM_BOT_TOKEN` and `MCP_TELEGRAM_CHAT_ID` are configured, HTTP mode now also starts the Telegram gateway in the background so `/submit`, `/resume`, `/sessions`, and `/tasks` are registered and handled by the same process.
 
 ### Testing Options
 ```bash
@@ -269,6 +341,10 @@ make quick-check                                        # Quick check and auto-f
 ### 🌐 SSH Remote Environment Issues
 **Q: Browser cannot launch or access in SSH Remote environment**
 A: Two solutions available:
+
+**Important Note (interactive_feedback prerequisites)**
+In **remote + headless** environments (no `DISPLAY`), `interactive_feedback` requires the IDE remote browser helper env vars `BROWSER` and `VSCODE_IPC_HOOK_CLI`.
+If the tool returns an error mentioning either one is missing, switch to `telegram_feedback` (or run `get_system_info` to confirm what env vars the MCP process actually has).
 
 **Solution 1: Environment Variable Setting (v2.5.5 Recommended)**
 Set `"MCP_WEB_HOST": "0.0.0.0"` in MCP configuration to allow remote access:
